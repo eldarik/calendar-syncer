@@ -1,0 +1,18 @@
+{
+  "name": "calendar-syncer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Copy current-week Google Calendar events into next week",
+  "scripts": {
+    "copy-week": "node src/copy-current-week-to-next.js",
+    "check": "node --check src/copy-current-week-to-next.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@google-cloud/local-auth": "^2.1.0",
+    "googleapis": "^105.0.0"
+  }
+}
