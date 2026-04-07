@@ -14,6 +14,7 @@ function parseArgs(argv) {
     calendarId: "primary",
     dryRun: false,
     help: false,
+    weeks: 1,
   };
 
   for (const arg of argv) {
@@ -36,6 +37,16 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg.startsWith("--weeks=") || arg.startsWith("weeks=")) {
+      const value = (arg.startsWith("--weeks=") ? arg.slice("--weeks=".length) : arg.slice("weeks=".length)).trim();
+      const weeks = Number.parseInt(value, 10);
+      if (!Number.isInteger(weeks) || weeks < 1) {
+        throw new Error("The weeks option must be a positive integer (1 or greater).");
+      }
+      options.weeks = weeks;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -47,6 +58,8 @@ function printHelp() {
 
 Options:
   --calendar=<id>  Calendar ID to use (default: primary)
+  --weeks=<n>      Number of weeks to copy forward (default: 1)
+  weeks=<n>        Same as --weeks (for npm compatibility)
   --dry-run        Show which events would be copied
   --help, -h       Show this help message`);
 }
@@ -153,7 +166,7 @@ function normalizeEventBoundary(boundary) {
   return `datetime:${new Date(boundary.dateTime).getTime()}`;
 }
 
-function buildCopiedEvent(event) {
+function buildCopiedEvent(event, days = 7) {
   const resource = {
     summary: event.summary ?? "(untitled)",
   };
@@ -172,11 +185,11 @@ function buildCopiedEvent(event) {
 
   if (event.start?.date && event.end?.date) {
     resource.start = {
-      date: shiftDateOnlyValue(event.start.date, 7),
+      date: shiftDateOnlyValue(event.start.date, days),
       timeZone: event.start.timeZone,
     };
     resource.end = {
-      date: shiftDateOnlyValue(event.end.date, 7),
+      date: shiftDateOnlyValue(event.end.date, days),
       timeZone: event.end.timeZone,
     };
     return resource;
@@ -189,11 +202,11 @@ function buildCopiedEvent(event) {
   }
 
   resource.start = {
-    dateTime: shiftRfc3339ByDays(event.start.dateTime, 7),
+    dateTime: shiftRfc3339ByDays(event.start.dateTime, days),
     timeZone: event.start.timeZone,
   };
   resource.end = {
-    dateTime: shiftRfc3339ByDays(event.end.dateTime, 7),
+    dateTime: shiftRfc3339ByDays(event.end.dateTime, days),
     timeZone: event.end.timeZone,
   };
 
@@ -243,6 +256,10 @@ function shouldCopyEvent(event) {
     return false;
   }
 
+  if (event.originalStartTime) {
+    return false;
+  }
+
   return true;
 }
 
@@ -259,66 +276,100 @@ async function listEvents(calendar, calendarId, timeMin, timeMax) {
   return response.data.items ?? [];
 }
 
-async function copyCurrentWeekToNext({ calendarId, dryRun }) {
+async function copyCurrentWeekToNext({ calendarId, dryRun, weeks = 1 }) {
   const auth = await authorize();
   const calendar = google.calendar({ version: "v3", auth });
 
   const currentWeek = getCurrentWeekRange();
-  const nextWeek = {
-    start: addDays(currentWeek.start, 7),
-    end: addDays(currentWeek.end, 7),
-  };
-
-  const [currentWeekEvents, nextWeekEvents] = await Promise.all([
+  const [currentWeekEvents] = await Promise.all([
     listEvents(calendar, calendarId, currentWeek.start, currentWeek.end),
-    listEvents(calendar, calendarId, nextWeek.start, nextWeek.end),
   ]);
 
-  const existingEventKeys = new Set(nextWeekEvents.map(getEventIdentity));
-  const results = {
+  const aggregateResults = {
     scanned: currentWeekEvents.length,
     copied: 0,
     skipped: 0,
     duplicates: 0,
     dryRun,
+    weeks,
+    weeklyDetails: [],
   };
 
-  for (const event of currentWeekEvents) {
-    if (!shouldCopyEvent(event)) {
-      results.skipped += 1;
-      continue;
+  for (let weekOffset = 1; weekOffset <= weeks; weekOffset++) {
+    const daysOffset = weekOffset * 7;
+    const targetWeek = {
+      start: addDays(currentWeek.start, daysOffset),
+      end: addDays(currentWeek.end, daysOffset),
+    };
+
+    const targetWeekEvents = await listEvents(
+      calendar,
+      calendarId,
+      targetWeek.start,
+      targetWeek.end,
+    );
+
+    const existingEventKeys = new Set(targetWeekEvents.map(getEventIdentity));
+    const weeklyResult = {
+      weekOffset,
+      copied: 0,
+      skipped: 0,
+      duplicates: 0,
+    };
+
+    if (!dryRun && weeks > 1) {
+      console.log(`Processing week ${weekOffset}...`);
     }
 
-    const copiedEvent = buildCopiedEvent(event);
-    const identity = getEventIdentity(copiedEvent);
+    for (const event of currentWeekEvents) {
+      if (!shouldCopyEvent(event)) {
+        weeklyResult.skipped += 1;
+        continue;
+      }
 
-    if (existingEventKeys.has(identity)) {
-      results.duplicates += 1;
-      continue;
-    }
+      const copiedEvent = buildCopiedEvent(event, daysOffset);
+      const identity = getEventIdentity(copiedEvent);
 
-    if (dryRun) {
+      if (existingEventKeys.has(identity)) {
+        weeklyResult.duplicates += 1;
+        continue;
+      }
+
+      if (dryRun) {
+        console.log(
+          `[dry-run] Week ${weekOffset}: Would copy: ${copiedEvent.summary} -> ${getEventStartKey(copiedEvent)}`,
+        );
+        existingEventKeys.add(identity);
+        weeklyResult.copied += 1;
+        continue;
+      }
+
+      await calendar.events.insert({
+        calendarId,
+        resource: copiedEvent,
+      });
+
       console.log(
-        `[dry-run] Would copy: ${copiedEvent.summary} -> ${getEventStartKey(copiedEvent)}`,
+        `Week ${weekOffset}: Copied: ${copiedEvent.summary} -> ${getEventStartKey(copiedEvent)}`,
       );
       existingEventKeys.add(identity);
-      results.copied += 1;
-      continue;
+      weeklyResult.copied += 1;
     }
 
-    await calendar.events.insert({
-      calendarId,
-      resource: copiedEvent,
+    aggregateResults.copied += weeklyResult.copied;
+    aggregateResults.skipped += weeklyResult.skipped;
+    aggregateResults.duplicates += weeklyResult.duplicates;
+    aggregateResults.weeklyDetails.push({
+      weekOffset,
+      start: targetWeek.start.toISOString(),
+      end: targetWeek.end.toISOString(),
+      ...weeklyResult,
     });
-
-    existingEventKeys.add(identity);
-    results.copied += 1;
   }
 
   return {
     currentWeek,
-    nextWeek,
-    results,
+    results: aggregateResults,
   };
 }
 
@@ -338,20 +389,39 @@ async function main() {
     );
   }
 
-  const { currentWeek, nextWeek, results } =
-    await copyCurrentWeekToNext(options);
+  const { currentWeek, results } = await copyCurrentWeekToNext(options);
 
   console.log(`Calendar: ${options.calendarId}`);
   console.log(
     `Current week: ${currentWeek.start.toISOString()} -> ${currentWeek.end.toISOString()}`,
   );
-  console.log(
-    `Next week:    ${nextWeek.start.toISOString()} -> ${nextWeek.end.toISOString()}`,
-  );
+
+  if (results.weeks === 1) {
+    const week = results.weeklyDetails[0];
+    console.log(
+      `Next week:    ${week.start} -> ${week.end}`,
+    );
+  } else {
+    console.log(`Copying to ${results.weeks} weeks:`);
+    results.weeklyDetails.forEach((week) => {
+      console.log(`  Week ${week.weekOffset}: ${week.start} -> ${week.end}`);
+    });
+  }
+
   console.log(`Scanned: ${results.scanned}`);
   console.log(`Copied: ${results.copied}`);
   console.log(`Skipped: ${results.skipped}`);
   console.log(`Duplicates avoided: ${results.duplicates}`);
+
+  if (results.weeks > 1) {
+    console.log(`\nWeekly breakdown:`);
+    results.weeklyDetails.forEach((week) => {
+      console.log(
+        `  Week ${week.weekOffset}: +${week.copied} copied, ${week.duplicates} duplicates avoided`,
+      );
+    });
+  }
+
   console.log(results.dryRun ? "Mode: dry-run" : "Mode: live");
 }
 

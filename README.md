@@ -38,6 +38,7 @@ After setup, run this from OpenCode:
 ## Options
 
 - `--calendar=<id>`: calendar ID to use, defaults to `primary`
+- `--weeks=<n>` or `weeks=<n>`: number of weeks to copy forward, defaults to `1`
 - `--dry-run`: prints what would be copied without creating events
 - `--help`: prints usage
 
@@ -46,12 +47,15 @@ Examples:
 ```bash
 npm run copy-week -- --dry-run
 npm run copy-week -- --calendar=primary
+npm run copy-week weeks=2
+npm run copy-week -- --weeks=3 --dry-run
 ```
 
 ## Behavior
 
 - Uses the current local week from Monday 00:00:00 to next Monday 00:00:00
 - Copies timed and all-day events
+- Can copy to multiple future weeks with the `weeks` option
 - Skips cancelled events
-- Skips recurring event instances to avoid duplicating naturally recurring events
-- Avoids duplicates in next week by matching title and start/end time
+- Skips all repeating/recurring events (parent events, instances, and modified instances)
+- Avoids duplicates in target weeks by matching title and start/end time
